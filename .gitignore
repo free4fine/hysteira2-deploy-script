@@ -1,0 +1,10 @@
+.DS_Store
+__MACOSX/
+*.key
+*.pem
+*.log
+*.bak
+.env
+client*.yaml
+password
+backups/

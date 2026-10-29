@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -u
+DOMAIN=jb1.1bigsale.win
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SITE=/var/www/far-and-field
+STATE=/var/lib/far-field-hysteria
+CONFIG_DIR=/etc/hysteria
+CONFIG=$CONFIG_DIR/config.yaml
+SERVICE=hysteria-server.service
+BINARY=/usr/local/bin/hysteria
+UNIT_DIR=/etc/systemd/system
+CLI_PATH=/usr/local/bin/hysteria-maintain
+BUNDLE=/usr/local/share/hysteria-maintain
+umask 077
+
+require_root() { (( EUID == 0 )) || { echo '请使用 sudo 运行。'; return 1; }; }
+owned() { [[ -f $STATE/owned ]]; }
+confirm() { local answer; read -r -p "$1 [y/N] " answer || return 1; [[ $answer == y || $answer == Y ]]; }
+
+valid_domain() {
+  local label
+  local -a labels
+  [[ ${#1} -le 253 && $1 == *.* && $1 != *..* && $1 != .* && $1 != *. ]] || return 1
+  IFS=. read -r -a labels <<< "$1"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+  done
+}
+
+load_domain() {
+  local saved=''
+  if [[ -r $STATE/domain ]]; then
+    read -r saved < "$STATE/domain"
+  elif [[ -r $CONFIG ]]; then
+    saved=$(awk '/^acme:/ {acme=1; next} acme && /^[^[:space:]]/ {exit} acme && /^[[:space:]]+- / {print $2; exit}' "$CONFIG")
+  fi
+  if valid_domain "$saved"; then DOMAIN=$saved; fi
+}
+
+ensure_dependencies() {
+  [[ $(uname -s) == Linux && -d /run/systemd/system ]] || { echo '安装需要运行 systemd 的 Linux。'; return 1; }
+  local command_name missing=0
+  for command_name in curl openssl unzip zipinfo sha256sum ss timeout getent; do
+    command -v "$command_name" >/dev/null || missing=1
+  done
+  if (( missing )); then
+    command -v apt-get >/dev/null || { echo '请先安装 curl openssl unzip iproute2 coreutils libc-bin util-linux。'; return 1; }
+    apt-get update && apt-get install -y ca-certificates curl openssl unzip iproute2 coreutils libc-bin util-linux || return 1
+  fi
+}
+
+find_website_archive() {
+  if [[ -f $SCRIPT_DIR/assets/far-and-field.zip ]]; then
+    printf '%s\n' "$SCRIPT_DIR/assets/far-and-field.zip"
+  elif [[ -f $BUNDLE/assets/far-and-field.zip ]]; then
+    printf '%s\n' "$BUNDLE/assets/far-and-field.zip"
+  else
+    echo '找不到随项目附带的 assets/far-and-field.zip，请上传完整项目。' >&2; return 1
+  fi
+}
+
+validate_website_archive() {
+  local archive=$1 expected actual entries
+  [[ -r $archive && -r $archive.sha256 ]] || { echo '网站 ZIP 或校验文件缺失。' >&2; return 1; }
+  expected=$(awk 'NR==1 {print $1}' "$archive.sha256")
+  actual=$(sha256sum "$archive" | awk '{print $1}')
+  [[ $expected =~ ^[0-9a-f]{64}$ && $expected == "$actual" ]] || { echo '网站 ZIP 校验失败。' >&2; return 1; }
+  unzip -tq "$archive" >/dev/null || { echo '网站 ZIP 已损坏。' >&2; return 1; }
+  entries=$(unzip -Z1 "$archive") || return 1
+  if printf '%s\n' "$entries" | grep -Eq '(^/|(^|/)\.\.(/|$)|\\|^[A-Za-z]:)' || zipinfo -l "$archive" | awk '$1 ~ /^l/ {found=1} END {exit !found}'; then
+    echo '网站 ZIP 含不安全路径或符号链接。' >&2; return 1
+  fi
+  printf '%s\n' "$entries" | grep -qx 'index.html' && printf '%s\n' "$entries" | grep -q '^assets/' || { echo '网站 ZIP 根目录必须包含 index.html 和 assets/。' >&2; return 1; }
+}
+
+install_website() {
+  local archive=$1 staging
+  validate_website_archive "$archive" || return 1
+  mkdir -p "$(dirname "$SITE")" || return 1
+  staging=$(mktemp -d "${SITE}.tmp.XXXXXX") || return 1
+  if ! unzip -q "$archive" -d "$staging" || ! chmod -R a+rX "$staging" || [[ ! -f $staging/index.html ]]; then
+    rm -rf -- "$staging"; return 1
+  fi
+  # Never merge into or replace a pre-existing website.
+  if [[ -e $SITE ]]; then rm -rf -- "$staging"; echo '网站目录已存在，停止覆盖。'; return 1; fi
+  mv "$staging" "$SITE"
+}
+
+persist_bundle() {
+  local archive=$1 destination=$BUNDLE/assets/far-and-field.zip
+  mkdir -p "$BUNDLE/assets" "$(dirname "$CLI_PATH")" || return 1
+  if [[ $archive != "$destination" ]]; then
+    install -m 644 "$archive" "$destination" && install -m 644 "$archive.sha256" "$destination.sha256" || return 1
+  fi
+  if [[ $SCRIPT_DIR/hysteria-maintain != "$CLI_PATH" ]]; then
+    install -m 755 "$SCRIPT_DIR/hysteria-maintain" "$CLI_PATH.new" && mv "$CLI_PATH.new" "$CLI_PATH" || return 1
+  fi
+}
+
+install_service() {
+  local pass backup archive requested_domain
+  require_root || return 1
+  ensure_dependencies || return 1
+  archive=$(find_website_archive) && validate_website_archive "$archive" || return 1
+  load_domain
+  if owned; then
+    confirm '已安装，是否重新安装？将保留密码并备份配置' || return 0
+    [[ -r $STATE/password && -r $CONFIG ]] || { echo '已有安装不完整，请先检查，未作更改。'; return 1; }
+    backup="$STATE/backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup" && cp -a "$CONFIG" "$STATE/password" "$backup/" || return 1
+    echo "配置备份：${backup}；保留现有配置和网站。"
+    [[ -f $STATE/install-official.sh ]] || { echo '缺少官方安装脚本，停止操作。'; return 1; }
+    if [[ ! -e $SITE ]]; then install_website "$archive" || return 1; fi
+    HYSTERIA_USER=root bash "$STATE/install-official.sh" --force || return 1
+    printf '%s\n' "$DOMAIN" > "$STATE/domain"
+    persist_bundle "$archive" || return 1
+    systemctl enable --now "$SERVICE" && systemctl restart "$SERVICE" && check_status
+    return
+  fi
+  if [[ -e $BINARY || -e $UNIT_DIR/hysteria-server.service || -e $UNIT_DIR/hysteria-server@.service || -e $CONFIG_DIR || -e $SITE || -e $STATE ]]; then
+    echo '发现已有 Hysteria 或网站文件，停止以免覆盖。'; return 1
+  fi
+  if ss -lntup | awk 'NR>1 {print $5}' | grep -Eq ':(80|443)$'; then echo 'TCP 或 UDP 80/443 已被占用，请先检查。'; return 1; fi
+  read -r -p "服务器域名 [$DOMAIN]：" requested_domain || return 1
+  requested_domain=${requested_domain:-$DOMAIN}
+  valid_domain "$requested_domain" || { echo '域名格式无效。'; return 1; }
+  DOMAIN=$requested_domain
+  mkdir -p "$STATE" && touch "$STATE/owned" || return 1
+  pass=$(openssl rand -hex 24) || return 1
+  printf '%s\n' "$pass" > "$STATE/password"
+  printf '%s\n' "$DOMAIN" > "$STATE/domain"
+  install_website "$archive" && persist_bundle "$archive" || return 1
+  echo '正在运行 Hysteria 官方安装脚本。'
+  curl -fsSL --retry 3 https://get.hy2.sh/ -o "$STATE/install-official.sh" || return 1
+  HYSTERIA_USER=root bash "$STATE/install-official.sh" || return 1
+  cat > "$CONFIG" <<EOF
+listen: :443
+acme:
+  domains:
+    - $DOMAIN
+  ca: letsencrypt
+  type: http
+  dir: $STATE/acme
+auth:
+  type: password
+  password: $pass
+masquerade:
+  type: file
+  file:
+    dir: $SITE
+  listenHTTPS: :443
+EOF
+  chmod 600 "$CONFIG"
+  systemctl enable --now "$SERVICE" || { echo '启动失败，请查看日志。'; return 1; }
+  check_status
+}
+
+check_status() {
+  require_root || return 1
+  local failed=0 warnings=0 main_pid active version enabled uptime_text='—'
+  local entered uptime_now elapsed public4 public6 dns4 dns6 http_code tls_ok=0
+  local service_text udp_text='[异常] 未监听' tcp_text='[异常] 未监听'
+  local site_text cert_text expiry expiry_epoch now_epoch remaining
+  local recent protocol_count timeout_count fatal_count recent_text
+
+  active=$(systemctl is-active "$SERVICE" 2>/dev/null) || active=${active:-unknown}
+  main_pid=$(systemctl show "$SERVICE" --property=MainPID --value 2>/dev/null) || main_pid=0
+  version=$("$BINARY" version 2>/dev/null | awk '$1 == "Version:" {print $2; exit}')
+  if systemctl is-enabled --quiet "$SERVICE"; then enabled='已启用'; else enabled='[提醒] 未启用'; warnings=1; fi
+  if [[ $active == active ]]; then
+    service_text='[正常] 运行中'
+    entered=$(systemctl show "$SERVICE" --property=ActiveEnterTimestampMonotonic --value 2>/dev/null) || entered=0
+    read -r uptime_now _ < /proc/uptime
+    if [[ $entered =~ ^[1-9][0-9]*$ ]]; then
+      elapsed=$(( ${uptime_now%%.*} - entered / 1000000 ))
+      (( elapsed < 0 )) && elapsed=0
+      printf -v uptime_text '%d天 %d小时 %d分钟' "$((elapsed / 86400))" "$((elapsed / 3600 % 24))" "$((elapsed / 60 % 60))"
+    fi
+  else
+    service_text="[异常] 未运行（${active}）"; failed=1
+  fi
+  if [[ $main_pid =~ ^[1-9][0-9]*$ ]]; then
+    ss -H -lnup 'sport = :443' 2>/dev/null | grep -Fq "pid=$main_pid," && udp_text='[正常] UDP 443'
+    ss -H -lntp 'sport = :443' 2>/dev/null | grep -Fq "pid=$main_pid," && tcp_text='[正常] TCP 443'
+  fi
+  [[ $udp_text == '[正常]'* && $tcp_text == '[正常]'* ]] || failed=1
+
+  # These are public egress addresses; failure to query is not proof of no IPv6.
+  public4=$(curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null) || public4='未获取'
+  public6=$(curl --noproxy '*' -6fsS --connect-timeout 2 --max-time 3 https://api6.ipify.org 2>/dev/null) || public6='未获取'
+  [[ $public4 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || public4='未获取'
+  [[ $public6 =~ ^[0-9a-fA-F:]+$ && $public6 == *:* ]] || public6='未获取'
+  dns4=$(timeout 4 getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ',' -)
+  dns6=$(timeout 4 getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '$1 ~ /:/ && $1 !~ /^::ffff:/ {print $1}' | sort -u | paste -sd ',' -)
+  if [[ -z $dns4 && -z $dns6 ]]; then warnings=1; fi
+
+  if http_code=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" -o /dev/null -w '%{http_code}' 2>/dev/null); then
+    tls_ok=1
+  fi
+  if (( tls_ok )) && [[ $http_code == 200 ]]; then
+    site_text='[正常] HTTP 200（本机 HTTPS）'
+  else
+    site_text="[异常] HTTPS 请求失败或返回非 200（HTTP ${http_code:-000}）"; failed=1
+  fi
+  expiry=$(timeout 4 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null) || expiry=''
+  expiry_epoch=$(date -d "${expiry#notAfter=}" +%s 2>/dev/null) || expiry_epoch=''
+  now_epoch=$(date +%s)
+  if [[ -n $expiry && $expiry_epoch =~ ^[0-9]+$ ]]; then
+    remaining=$((expiry_epoch - now_epoch))
+    if (( remaining <= 0 )); then
+      cert_text='[异常] 证书已到期'; failed=1
+    elif (( ! tls_ok )); then
+      cert_text='[异常] 证书存在，但 HTTPS 校验未通过'; failed=1
+    elif (( remaining < 1209600 )); then
+      cert_text="[提醒] 校验通过 · 剩余 $((remaining / 86400)) 天 · 到期 $(date -u -d "${expiry#notAfter=}" +%F)"; warnings=1
+    else
+      cert_text="[正常] 校验通过 · 剩余 $((remaining / 86400)) 天 · 到期 $(date -u -d "${expiry#notAfter=}" +%F)"
+    fi
+  else
+    cert_text='[异常] 无法读取正在提供的证书'; failed=1
+  fi
+
+  # Count disconnect events once, not every failed stream on the same connection.
+  if recent=$(journalctl -u "$SERVICE" --since '10 minutes ago' -o cat --no-pager 2>/dev/null); then
+    protocol_count=$(printf '%s\n' "$recent" | awk '/client disconnected/ && /H3_FRAME_UNEXPECTED|expected first frame|0x105/ {n++} END {print n+0}')
+    timeout_count=$(printf '%s\n' "$recent" | awk '/client disconnected/ && /timeout: no recent network activity/ {n++} END {print n+0}')
+    fatal_count=$(printf '%s\n' "$recent" | awk '/FATAL|failed to load server config|failed to initialize server/ {n++} END {print n+0}')
+    if (( protocol_count + timeout_count + fatal_count > 0 )); then
+      recent_text="[提醒] 协议断连 ${protocol_count} 次 · 超时断连 ${timeout_count} 次 · 严重错误 ${fatal_count} 条"; warnings=1
+    else
+      recent_text='未发现协议断连、超时断连或严重错误'
+    fi
+  else
+    recent_text='[提醒] 无法读取日志'; warnings=1
+  fi
+
+  printf '\nHysteria 2 状态 · %s（北京时间）\n' "$(TZ=Asia/Shanghai date '+%F %T')"
+  if (( failed )); then echo '检查结果    [异常] 需要处理，请查看下列异常项'
+  elif (( warnings )); then echo '检查结果    [提醒] 核心服务检查通过，有事项需关注'
+  else echo '检查结果    [正常] 服务端核心检查通过'; fi
+  printf '服务状态    %s · 持续运行 %s\n' "$service_text" "$uptime_text"
+  printf '服务版本    %s · 开机启动 %s\n' "${version:-未获取}" "$enabled"
+  printf '服务域名    %s\n' "$DOMAIN"
+  printf '公网 IPv4   %s\n公网 IPv6   %s\n' "$public4" "$public6"
+  printf '域名 A      %s\n域名 AAAA   %s\n' "${dns4:-无记录或查询失败}" "${dns6:-无记录或查询失败}"
+  printf '代理入口    %s\n网站入口    %s\n' "$udp_text" "$tcp_text"
+  printf '域名证书    %s\n网站检查    %s\n' "$cert_text" "$site_text"
+  printf '近10分钟    %s\n' "$recent_text"
+  echo '公网连接    未进行外部客户端测试（监听、本机访问不代表公网可用）'
+  echo '详细日志    请选择菜单 3 查看'
+  return "$failed"
+}
+show_config() {
+  require_root && owned && [[ -r $STATE/password ]] || { echo '没有找到本方案的凭据。'; return 1; }
+  local pass; read -r pass < "$STATE/password"
+  printf '类型：Hysteria 2\n服务器：%s\n端口：443\nSNI：%s\n密码：%s\nTLS 验证：启用\n分享链接含密码，请妥善保管：\nhysteria2://%s@%s:443/?sni=%s#Oracle-JP1\n' "$DOMAIN" "$DOMAIN" "$pass" "$pass" "$DOMAIN" "$DOMAIN"
+}
+remove_service() {
+  require_root && owned || { echo '未发现本方案管理的安装。'; return 1; }
+  confirm '将删除本方案的 Hysteria、网站、配置和凭据，确认删除？' || return 0
+  systemctl disable --now "$SERVICE" || true
+  if [[ -f $STATE/install-official.sh ]]; then bash "$STATE/install-official.sh" --remove || { echo '官方卸载失败，停止清理。'; return 1; }; fi
+  rm -rf -- "$SITE" "$STATE" "$CONFIG_DIR"
+  echo '已删除本方案的服务、网站和凭据；菜单脚本、安装用网站包和防火墙规则保留，可再次安装。'
+}
+# Allow read-only function tests without entering the interactive menu.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
+require_root || exit 1
+load_domain
+while true; do
+  printf '\nHysteria 2 运维\n1. 安装或重新安装\n2. 检查状态\n3. 查看服务日志\n4. 查看客户端参数和分享链接\n5. 重启服务\n6. 一键删除\n0. 退出\n'
+  read -r -p '请选择：' choice || exit 0
+  case "$choice" in
+    1) install_service ;;
+    2) check_status ;;
+    3) journalctl -u "$SERVICE" -n 100 --no-pager ;;
+    4) show_config ;;
+    5) owned && systemctl restart "$SERVICE" && check_status ;;
+    6) remove_service ;;
+    0) exit 0 ;;
+    *) echo '请输入 0–6。' ;;
+  esac
+done
