@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -u
-DOMAIN=jb1.1bigsale.win
+DOMAIN=''
+PROXY_PORT=443
+WEB_PORT=443
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SITE=/var/www/far-and-field
 STATE=/var/lib/far-field-hysteria
@@ -35,6 +37,70 @@ load_domain() {
     saved=$(awk '/^acme:/ {acme=1; next} acme && /^[^[:space:]]/ {exit} acme && /^[[:space:]]+- / {print $2; exit}' "$CONFIG")
   fi
   if valid_domain "$saved"; then DOMAIN=$saved; fi
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+load_settings() {
+  load_domain
+  PROXY_PORT=443
+  WEB_PORT=443
+  local saved_proxy='' saved_web=''
+  if [[ -r $CONFIG ]]; then
+    saved_proxy=$(awk '$1 == "listen:" {sub(/^.*:/,"",$2); print $2; exit}' "$CONFIG")
+    saved_web=$(awk '$1 == "listenHTTPS:" {sub(/^.*:/,"",$2); print $2; exit}' "$CONFIG")
+  fi
+  if valid_port "$saved_proxy"; then PROXY_PORT=$((10#$saved_proxy)); fi
+  if valid_port "$saved_web"; then WEB_PORT=$((10#$saved_web)); fi
+}
+
+installation_wizard() {
+  local requested_domain requested_proxy requested_web
+  echo 'Hysteria 2 首次安装向导'
+  echo '1/3 填写服务器域名，例如 example.com；不需要 https:// 或路径。'
+  while true; do
+    read -r -p '服务器域名：' requested_domain || return 1
+    if valid_domain "$requested_domain"; then break; fi
+    echo '域名格式无效，请重新填写。'
+  done
+  echo '2/3 填写 Hysteria 代理 UDP 端口。'
+  while true; do
+    read -r -p '代理 UDP 端口 [443]：' requested_proxy || return 1
+    requested_proxy=${requested_proxy:-443}
+    if valid_port "$requested_proxy"; then requested_proxy=$((10#$requested_proxy)); break; fi
+    echo '请输入 1–65535 之间的端口。'
+  done
+  echo '3/3 填写网站 HTTPS TCP 端口；可以与代理使用相同数字。'
+  while true; do
+    read -r -p '网站 HTTPS 端口 [443]：' requested_web || return 1
+    requested_web=${requested_web:-443}
+    if valid_port "$requested_web"; then
+      requested_web=$((10#$requested_web))
+      if (( requested_web != 80 )); then break; fi
+      echo 'TCP 80 保留给证书 HTTP 验证，请选择其他 HTTPS 端口。'
+    else
+      echo '请输入 1–65535 之间的端口。'
+    fi
+  done
+  printf '\n安装参数\n域名：%s\n代理：UDP %s\n网站：https://%s:%s/\n证书验证：TCP 80（固定）\n' "$requested_domain" "$requested_proxy" "$requested_domain" "$requested_web"
+  printf '请在云端和系统防火墙放行：UDP %s、TCP %s、TCP 80。\n' "$requested_proxy" "$requested_web"
+  echo '网站将自动安装 Far & Field，代理密码自动生成。'
+  confirm '确认按以上参数开始安装？' || { echo '已取消安装。'; return 2; }
+  DOMAIN=$requested_domain
+  PROXY_PORT=$requested_proxy
+  WEB_PORT=$requested_web
+}
+
+check_ports_available() {
+  local port listeners
+  for port in 80 "$WEB_PORT"; do
+    listeners=$(ss -H -lnt "sport = :$port") || { echo '无法检查 TCP 端口占用。'; return 1; }
+    [[ -z $listeners ]] || { echo "TCP ${port} 已被占用，停止安装。"; return 1; }
+  done
+  listeners=$(ss -H -lnu "sport = :$PROXY_PORT") || { echo '无法检查 UDP 端口占用。'; return 1; }
+  [[ -z $listeners ]] || { echo "UDP ${PROXY_PORT} 已被占用，停止安装。"; return 1; }
 }
 
 ensure_dependencies() {
@@ -98,13 +164,14 @@ persist_bundle() {
 }
 
 install_service() {
-  local pass backup archive requested_domain
+  local pass backup archive wizard_result
   require_root || return 1
-  ensure_dependencies || return 1
-  archive=$(find_website_archive) && validate_website_archive "$archive" || return 1
-  load_domain
+  load_settings
   if owned; then
+    printf '当前配置：域名 %s · 代理 UDP %s · 网站 TCP %s\n' "$DOMAIN" "$PROXY_PORT" "$WEB_PORT"
     confirm '已安装，是否重新安装？将保留密码并备份配置' || return 0
+    ensure_dependencies || return 1
+    archive=$(find_website_archive) && validate_website_archive "$archive" || return 1
     [[ -r $STATE/password && -r $CONFIG ]] || { echo '已有安装不完整，请先检查，未作更改。'; return 1; }
     backup="$STATE/backup-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$backup" && cp -a "$CONFIG" "$STATE/password" "$backup/" || return 1
@@ -120,11 +187,14 @@ install_service() {
   if [[ -e $BINARY || -e $UNIT_DIR/hysteria-server.service || -e $UNIT_DIR/hysteria-server@.service || -e $CONFIG_DIR || -e $SITE || -e $STATE ]]; then
     echo '发现已有 Hysteria 或网站文件，停止以免覆盖。'; return 1
   fi
-  if ss -lntup | awk 'NR>1 {print $5}' | grep -Eq ':(80|443)$'; then echo 'TCP 或 UDP 80/443 已被占用，请先检查。'; return 1; fi
-  read -r -p "服务器域名 [$DOMAIN]：" requested_domain || return 1
-  requested_domain=${requested_domain:-$DOMAIN}
-  valid_domain "$requested_domain" || { echo '域名格式无效。'; return 1; }
-  DOMAIN=$requested_domain
+  if installation_wizard; then :; else
+    wizard_result=$?
+    (( wizard_result == 2 )) && return 0
+    return 1
+  fi
+  ensure_dependencies || return 1
+  archive=$(find_website_archive) && validate_website_archive "$archive" || return 1
+  check_ports_available || return 1
   mkdir -p "$STATE" && touch "$STATE/owned" || return 1
   pass=$(openssl rand -hex 24) || return 1
   printf '%s\n' "$pass" > "$STATE/password"
@@ -134,7 +204,7 @@ install_service() {
   curl -fsSL --retry 3 https://get.hy2.sh/ -o "$STATE/install-official.sh" || return 1
   HYSTERIA_USER=root bash "$STATE/install-official.sh" || return 1
   cat > "$CONFIG" <<EOF
-listen: :443
+listen: :$PROXY_PORT
 acme:
   domains:
     - $DOMAIN
@@ -148,7 +218,7 @@ masquerade:
   type: file
   file:
     dir: $SITE
-  listenHTTPS: :443
+  listenHTTPS: :$WEB_PORT
 EOF
   chmod 600 "$CONFIG"
   systemctl enable --now "$SERVICE" || { echo '启动失败，请查看日志。'; return 1; }
@@ -157,6 +227,7 @@ EOF
 
 check_status() {
   require_root || return 1
+  load_settings
   local failed=0 warnings=0 main_pid active version enabled uptime_text='—'
   local entered uptime_now elapsed public4 public6 dns4 dns6 http_code tls_ok=0
   local service_text udp_text='[异常] 未监听' tcp_text='[异常] 未监听'
@@ -180,8 +251,8 @@ check_status() {
     service_text="[异常] 未运行（${active}）"; failed=1
   fi
   if [[ $main_pid =~ ^[1-9][0-9]*$ ]]; then
-    ss -H -lnup 'sport = :443' 2>/dev/null | grep -Fq "pid=$main_pid," && udp_text='[正常] UDP 443'
-    ss -H -lntp 'sport = :443' 2>/dev/null | grep -Fq "pid=$main_pid," && tcp_text='[正常] TCP 443'
+    ss -H -lnup "sport = :$PROXY_PORT" 2>/dev/null | grep -Fq "pid=$main_pid," && udp_text="[正常] UDP $PROXY_PORT"
+    ss -H -lntp "sport = :$WEB_PORT" 2>/dev/null | grep -Fq "pid=$main_pid," && tcp_text="[正常] TCP $WEB_PORT"
   fi
   [[ $udp_text == '[正常]'* && $tcp_text == '[正常]'* ]] || failed=1
 
@@ -194,7 +265,7 @@ check_status() {
   dns6=$(timeout 4 getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '$1 ~ /:/ && $1 !~ /^::ffff:/ {print $1}' | sort -u | paste -sd ',' -)
   if [[ -z $dns4 && -z $dns6 ]]; then warnings=1; fi
 
-  if http_code=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" -o /dev/null -w '%{http_code}' 2>/dev/null); then
+  if http_code=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 5 --resolve "$DOMAIN:$WEB_PORT:127.0.0.1" "https://$DOMAIN:$WEB_PORT/" -o /dev/null -w '%{http_code}' 2>/dev/null); then
     tls_ok=1
   fi
   if (( tls_ok )) && [[ $http_code == 200 ]]; then
@@ -202,7 +273,7 @@ check_status() {
   else
     site_text="[异常] HTTPS 请求失败或返回非 200（HTTP ${http_code:-000}）"; failed=1
   fi
-  expiry=$(timeout 4 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null) || expiry=''
+  expiry=$(timeout 4 openssl s_client -connect "127.0.0.1:$WEB_PORT" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null) || expiry=''
   expiry_epoch=$(date -d "${expiry#notAfter=}" +%s 2>/dev/null) || expiry_epoch=''
   now_epoch=$(date +%s)
   if [[ -n $expiry && $expiry_epoch =~ ^[0-9]+$ ]]; then
@@ -241,6 +312,7 @@ check_status() {
   printf '服务状态    %s · 持续运行 %s\n' "$service_text" "$uptime_text"
   printf '服务版本    %s · 开机启动 %s\n' "${version:-未获取}" "$enabled"
   printf '服务域名    %s\n' "$DOMAIN"
+  printf '网站地址    https://%s:%s/\n' "$DOMAIN" "$WEB_PORT"
   printf '公网 IPv4   %s\n公网 IPv6   %s\n' "$public4" "$public6"
   printf '域名 A      %s\n域名 AAAA   %s\n' "${dns4:-无记录或查询失败}" "${dns6:-无记录或查询失败}"
   printf '代理入口    %s\n网站入口    %s\n' "$udp_text" "$tcp_text"
@@ -252,8 +324,9 @@ check_status() {
 }
 show_config() {
   require_root && owned && [[ -r $STATE/password ]] || { echo '没有找到本方案的凭据。'; return 1; }
+  load_settings
   local pass; read -r pass < "$STATE/password"
-  printf '类型：Hysteria 2\n服务器：%s\n端口：443\nSNI：%s\n密码：%s\nTLS 验证：启用\n分享链接含密码，请妥善保管：\nhysteria2://%s@%s:443/?sni=%s#Oracle-JP1\n' "$DOMAIN" "$DOMAIN" "$pass" "$pass" "$DOMAIN" "$DOMAIN"
+  printf '类型：Hysteria 2\n服务器：%s\n端口：%s\nSNI：%s\n密码：%s\nTLS 验证：启用\n分享链接含密码，请妥善保管：\nhysteria2://%s@%s:%s/?sni=%s#Hysteria2-%s\n' "$DOMAIN" "$PROXY_PORT" "$DOMAIN" "$pass" "$pass" "$DOMAIN" "$PROXY_PORT" "$DOMAIN" "$DOMAIN"
 }
 remove_service() {
   require_root && owned || { echo '未发现本方案管理的安装。'; return 1; }
@@ -266,7 +339,7 @@ remove_service() {
 # Allow read-only function tests without entering the interactive menu.
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
 require_root || exit 1
-load_domain
+load_settings
 while true; do
   printf '\nHysteria 2 运维\n1. 安装或重新安装\n2. 检查状态\n3. 查看服务日志\n4. 查看客户端参数和分享链接\n5. 重启服务\n6. 一键删除\n0. 退出\n'
   read -r -p '请选择：' choice || exit 0
