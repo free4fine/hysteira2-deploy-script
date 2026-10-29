@@ -19,6 +19,7 @@ BUNDLE=$TEST_ROOT/bundle
 require_root() { return 0; }
 ensure_dependencies() { return 0; }
 check_status() { echo '模拟服务状态检查完成'; }
+wait_for_https() { return 0; }
 ss() { return 0; }
 systemctl() { printf '%s\n' "$*" >> "$TEST_ROOT/service-calls"; }
 openssl() { [[ $1 == rand ]] || return 1; printf '%048d\n' 1; }

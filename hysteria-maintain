@@ -163,6 +163,23 @@ persist_bundle() {
   fi
 }
 
+wait_for_https() {
+  local wait_seconds=${1:-60} deadline code=''
+  deadline=$((SECONDS + wait_seconds))
+  printf '正在等待 HTTPS 就绪（最多 %s 秒，首次签发证书需要时间）……\n' "$wait_seconds"
+  while (( SECONDS < deadline )); do
+    if ! systemctl is-active --quiet "$SERVICE"; then
+      echo '服务尚未运行，请检查下列状态和菜单 3 的日志。'; return 1
+    fi
+    if code=$(curl --noproxy '*' -sS --connect-timeout 1 --max-time 2 --resolve "$DOMAIN:$WEB_PORT:127.0.0.1" "https://$DOMAIN:$WEB_PORT/" -o /dev/null -w '%{http_code}' 2>/dev/null) && [[ $code == 200 ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo '等待 HTTPS 就绪超时，请查看下列状态和菜单 3 的证书日志。'
+  return 1
+}
+
 install_service() {
   local pass backup archive wizard_result
   require_root || return 1
@@ -181,7 +198,9 @@ install_service() {
     HYSTERIA_USER=root bash "$STATE/install-official.sh" --force || return 1
     printf '%s\n' "$DOMAIN" > "$STATE/domain"
     persist_bundle "$archive" || return 1
-    systemctl enable --now "$SERVICE" && systemctl restart "$SERVICE" && check_status
+    systemctl enable --now "$SERVICE" && systemctl restart "$SERVICE" || return 1
+    wait_for_https || true
+    check_status
     return
   fi
   if [[ -e $BINARY || -e $UNIT_DIR/hysteria-server.service || -e $UNIT_DIR/hysteria-server@.service || -e $CONFIG_DIR || -e $SITE || -e $STATE ]]; then
@@ -222,6 +241,7 @@ masquerade:
 EOF
   chmod 600 "$CONFIG"
   systemctl enable --now "$SERVICE" || { echo '启动失败，请查看日志。'; return 1; }
+  wait_for_https || true
   check_status
 }
 
@@ -348,7 +368,7 @@ while true; do
     2) check_status ;;
     3) journalctl -u "$SERVICE" -n 100 --no-pager ;;
     4) show_config ;;
-    5) owned && systemctl restart "$SERVICE" && check_status ;;
+    5) if owned && systemctl restart "$SERVICE"; then wait_for_https || true; check_status; fi ;;
     6) remove_service ;;
     0) exit 0 ;;
     *) echo '请输入 0–6。' ;;

@@ -29,7 +29,7 @@ sudo bash ./hysteria-maintain
 sudo hysteria-maintain
 ```
 
-首次证书签发可能需要一段时间；若刚启动时网站检查未通过，稍后选择 `2` 复查，或选择 `3` 查看签发日志。客户端参数和分享链接在菜单 `4`，分享链接包含密码。
+安装、重装和重启后会等待 HTTPS 就绪，最多约 60 秒，再显示状态，避免首次证书尚未签发时立即报异常。如果等待超时，仍会显示实际检查结果，可稍后选择 `2` 复查，或选择 `3` 查看签发日志。客户端参数和分享链接在菜单 `4`，分享链接包含密码。
 
 ### 系统要求
 
@@ -81,13 +81,18 @@ bash tools/package-website.sh /绝对路径/网站/dist
 
 ## 验证
 
+本地回归测试和网站打包需要 `zip`、`unzip`、`zipinfo` 命令。Ubuntu / Debian 可先安装 `zip unzip`；这属于开发与验收工具，服务器正常安装只需要脚本自动检查的运行依赖。
+
 ```bash
 bash -n hysteria-maintain
 bash tests/test-install.sh
 bash tests/test-status-ports.sh
+bash tests/test-readiness.sh
 ```
 
 测试使用模拟的官方安装程序及服务命令，全部文件写入临时目录，不连接 VPS、不安装真实服务。网站 ZIP 则进行实际校验、解压和文件对比。
+
+真机安装、重装、删除及公网连接的验证结果见 [JP2 验收记录](docs/JP2-ACCEPTANCE-2026-10-29.md)，其中单独记录了当前电脑访问网站时的间歇 TCP 超时及对照结果。
 
 ## 官方参考
 
