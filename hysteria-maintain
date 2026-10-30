@@ -180,6 +180,106 @@ wait_for_https() {
   return 1
 }
 
+installed_version() {
+  "$BINARY" version 2>/dev/null | awk '$1 == "Version:" {print $2; exit}'
+}
+
+verify_upgrade() {
+  local expected=$1 config_hash=$2 password_hash=$3 site_hash=$4 pid
+  [[ $(installed_version) == "$expected" ]] || { echo '升级后版本不符合预期。'; return 1; }
+  [[ $(sha256sum "$CONFIG" | awk '{print $1}') == "$config_hash" &&
+     $(sha256sum "$STATE/password" | awk '{print $1}') == "$password_hash" &&
+     $(sha256sum "$SITE/index.html" | awk '{print $1}') == "$site_hash" ]] || {
+    echo '升级后配置、密码或网站首页发生变化。'; return 1;
+  }
+  systemctl is-active --quiet "$SERVICE" || { echo '升级后服务未运行。'; return 1; }
+  pid=$(systemctl show "$SERVICE" --property=MainPID --value) || return 1
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || { echo '升级后无法读取服务进程。'; return 1; }
+  ss -H -lnup "sport = :$PROXY_PORT" | grep -Fq "pid=$pid," || { echo "升级后 UDP $PROXY_PORT 未监听。"; return 1; }
+  ss -H -lntp "sport = :$WEB_PORT" | grep -Fq "pid=$pid," || { echo "升级后 TCP $WEB_PORT 未监听。"; return 1; }
+  wait_for_https 60 || return 1
+}
+
+rollback_upgrade() {
+  local backup=$1 expected=$2 config_hash=$3 password_hash=$4 site_hash=$5
+  echo "升级验证失败，正在从 $backup 恢复程序和服务文件。"
+  cp -a -- "$backup/hysteria" "$BINARY.rollback.$$" &&
+    mv -f -- "$BINARY.rollback.$$" "$BINARY" &&
+    cp -a -- "$backup/config.yaml" "$CONFIG" &&
+    cp -a -- "$backup/password" "$STATE/password" &&
+    cp -a -- "$backup/install-official.sh" "$STATE/install-official.sh" &&
+    cp -a -- "$backup/hysteria-server.service" "$UNIT_DIR/hysteria-server.service" &&
+    cp -a -- "$backup/hysteria-server@.service" "$UNIT_DIR/hysteria-server@.service" &&
+    systemctl daemon-reload && systemctl restart "$SERVICE" &&
+    verify_upgrade "$expected" "$config_hash" "$password_hash" "$site_hash" || {
+      echo "[异常] 自动恢复失败；备份保留在 ${backup}，请人工检查服务。"
+      return 1
+    }
+  echo "已恢复原版本 $(installed_version)；备份保留在 ${backup}。"
+}
+
+upgrade_service() {
+  local installer check_output current latest backup config_hash password_hash site_hash
+  require_root || return 1
+  owned && [[ -x $BINARY && -r $CONFIG && -r $SITE/index.html && -r $STATE/password && -r $STATE/install-official.sh &&
+    -r $UNIT_DIR/hysteria-server.service && -r $UNIT_DIR/hysteria-server@.service ]] || {
+    echo '没有找到完整的本项目安装，停止升级。'; return 1;
+  }
+  systemctl is-active --quiet "$SERVICE" || { echo '服务当前未运行，请先检查状态，停止升级。'; return 1; }
+  load_settings
+  current=$(installed_version)
+  [[ $current =~ ^v2\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+    echo '无法识别当前 Hysteria 2 版本，停止升级。'; return 1;
+  }
+  echo "当前版本：${current}；正在查询官方最新版本。"
+  installer=$(mktemp "$STATE/upgrade-installer.XXXXXX") || return 1
+  if ! curl -fsSL --retry 3 https://get.hy2.sh/ -o "$installer" || ! bash -n "$installer"; then
+    rm -f -- "$installer"; echo '官方安装脚本下载或语法检查失败，未修改服务。'; return 1
+  fi
+  check_output=$(HYSTERIA_USER=root bash "$installer" --check 2>&1) || {
+    rm -f -- "$installer"; echo '官方版本查询失败，未修改服务。'; return 1;
+  }
+  latest=$(printf '%s\n' "$check_output" | awk '/Checking for latest version/ {print $NF}' | tail -1)
+  if [[ ! $latest =~ ^v2\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    rm -f -- "$installer"; echo '官方未返回有效的 Hysteria 2 版本，未修改服务。'; return 1
+  fi
+  printf '官方最新：%s\n' "$latest"
+  if [[ $current == "$latest" ]]; then
+    confirm '已经是最新版本，是否用官方脚本重新安装同版本以检查升级流程？' || {
+      rm -f -- "$installer"; echo '未修改服务。'; return 0;
+    }
+  elif [[ $(printf '%s\n' "$latest" "$current" | sort -V | head -1) == "$latest" ]]; then
+    rm -f -- "$installer"; echo '当前版本高于官方稳定版，停止以避免降级。'; return 1
+  else
+    confirm "是否升级到 ${latest}？升级会短暂中断代理连接" || {
+      rm -f -- "$installer"; echo '已取消升级。'; return 0;
+    }
+  fi
+  backup=$(mktemp -d "$STATE/upgrade-backup-$(date +%Y%m%d-%H%M%S).XXXXXX") || {
+    rm -f -- "$installer"; return 1;
+  }
+  if ! cp -a -- "$BINARY" "$CONFIG" "$STATE/password" "$STATE/install-official.sh" \
+    "$UNIT_DIR/hysteria-server.service" "$UNIT_DIR/hysteria-server@.service" "$backup/"; then
+    rm -f -- "$installer"; echo '备份失败，未修改服务。'; return 1
+  fi
+  config_hash=$(sha256sum "$CONFIG" | awk '{print $1}')
+  password_hash=$(sha256sum "$STATE/password" | awk '{print $1}')
+  site_hash=$(sha256sum "$SITE/index.html" | awk '{print $1}')
+  echo "升级前备份：$backup"
+  if ! HYSTERIA_USER=root bash "$installer" --version "$latest" --force ||
+     ! verify_upgrade "$latest" "$config_hash" "$password_hash" "$site_hash"; then
+    rm -f -- "$installer"
+    rollback_upgrade "$backup" "$current" "$config_hash" "$password_hash" "$site_hash" || true
+    return 1
+  fi
+  install -m 600 "$installer" "$STATE/install-official.sh" || {
+    rm -f -- "$installer"; rollback_upgrade "$backup" "$current" "$config_hash" "$password_hash" "$site_hash" || true; return 1;
+  }
+  rm -f -- "$installer"
+  echo "升级验证通过：${current} → ${latest}；域名、端口、密码和网站已保留。"
+  check_status
+}
+
 install_service() {
   local pass backup archive wizard_result
   require_root || return 1
@@ -361,7 +461,7 @@ if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
 require_root || exit 1
 load_settings
 while true; do
-  printf '\nHysteria 2 运维\n1. 安装或重新安装\n2. 检查状态\n3. 查看服务日志\n4. 查看客户端参数和分享链接\n5. 重启服务\n6. 一键删除\n0. 退出\n'
+  printf '\nHysteria 2 运维\n1. 安装或重新安装\n2. 检查状态\n3. 查看服务日志\n4. 查看客户端参数和分享链接\n5. 重启服务\n6. 一键删除\n7. 升级 Hysteria 2\n0. 退出\n'
   read -r -p '请选择：' choice || exit 0
   case "$choice" in
     1) install_service ;;
@@ -370,7 +470,8 @@ while true; do
     4) show_config ;;
     5) if owned && systemctl restart "$SERVICE"; then wait_for_https || true; check_status; fi ;;
     6) remove_service ;;
+    7) upgrade_service ;;
     0) exit 0 ;;
-    *) echo '请输入 0–6。' ;;
+    *) echo '请输入 0–7。' ;;
   esac
 done
