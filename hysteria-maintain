@@ -349,7 +349,7 @@ check_status() {
   require_root || return 1
   load_settings
   local failed=0 warnings=0 main_pid active version enabled uptime_text='—'
-  local entered uptime_now elapsed public4 public6 dns4 dns6 http_code tls_ok=0
+  local entered uptime_now elapsed public4 public6 dns4 dns6 dns_text http_code tls_ok=0
   local service_text udp_text='[异常] 未监听' tcp_text='[异常] 未监听'
   local site_text cert_text expiry expiry_epoch now_epoch remaining
   local recent protocol_count timeout_count fatal_count recent_text
@@ -383,7 +383,15 @@ check_status() {
   [[ $public6 =~ ^[0-9a-fA-F:]+$ && $public6 == *:* ]] || public6='未获取'
   dns4=$(timeout 4 getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ',' -)
   dns6=$(timeout 4 getent ahostsv6 "$DOMAIN" 2>/dev/null | awk '$1 ~ /:/ && $1 !~ /^::ffff:/ {print $1}' | sort -u | paste -sd ',' -)
-  if [[ -z $dns4 && -z $dns6 ]]; then warnings=1; fi
+  if [[ -n $dns4 && -n $dns6 ]]; then
+    dns_text='[正常] A、AAAA 可解析'
+  elif [[ -n $dns4 ]]; then
+    dns_text='[正常] A 可解析'
+  elif [[ -n $dns6 ]]; then
+    dns_text='[正常] AAAA 可解析'
+  else
+    dns_text='[提醒] 暂未取得 A/AAAA 解析结果'; warnings=1
+  fi
 
   if http_code=$(curl --noproxy '*' -sS --connect-timeout 2 --max-time 5 --resolve "$DOMAIN:$WEB_PORT:127.0.0.1" "https://$DOMAIN:$WEB_PORT/" -o /dev/null -w '%{http_code}' 2>/dev/null); then
     tls_ok=1
@@ -434,7 +442,7 @@ check_status() {
   printf '服务域名    %s\n' "$DOMAIN"
   printf '网站地址    https://%s:%s/\n' "$DOMAIN" "$WEB_PORT"
   printf '公网 IPv4   %s\n公网 IPv6   %s\n' "$public4" "$public6"
-  printf '域名 A      %s\n域名 AAAA   %s\n' "${dns4:-无记录或查询失败}" "${dns6:-无记录或查询失败}"
+  printf '域名解析    %s\n' "$dns_text"
   printf '代理入口    %s\n网站入口    %s\n' "$udp_text" "$tcp_text"
   printf '域名证书    %s\n网站检查    %s\n' "$cert_text" "$site_text"
   printf '近10分钟    %s\n' "$recent_text"
